@@ -31,13 +31,22 @@ app =FastAPI(
     version="0.1.0"
 )
 
-# CORS middleware
+# CORS middleware - SECURITY FIX: No more wildcard!
+# First Principles: allow_origins=["*"] lets ANY website call your API
+# Attackers could trigger video processing using victim's browser session
+
+# Get allowed origins from environment (comma-separated) or use safe defaults
+CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:8501,http://localhost:3000,http://127.0.0.1:8501,http://127.0.0.1:3000").split(",")
+CORS_ORIGINS = [origin.strip() for origin in CORS_ORIGINS if origin.strip()]
+
+print(f"🔒 CORS allowed origins: {CORS_ORIGINS}")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ORIGINS,  # Restricted to known origins
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],  # Only needed methods
+    allow_headers=["Content-Type", "Authorization", "X-API-Key"],  # Only needed headers
 )
 
 # Global state
@@ -56,12 +65,98 @@ DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
 
 @app.on_event("startup")
 async def startup():
-    """Initialize models and load existing index if available"""
+    """
+    Initialize models and verify all dependencies.
+    
+    First Principles:
+    - Fail fast: Better to crash on startup than mid-job
+    - Clear errors: Tell user exactly what's missing
+    - Check everything: FFmpeg, GCP, API keys, disk space
+    """
     global memory_layer, vision_sensor, audio_sensor
     
     print("=" * 60)
-    print("🚀 Starting Semantic A-Roll/B-Roll Engine")
+    print("🚀 Starting ClipSync - AI-Powered B-Roll Insertion")
     print("=" * 60)
+    
+    # =========================================================================
+    # DEPENDENCY HEALTH CHECKS
+    # =========================================================================
+    print("\n🔍 Running dependency health checks...")
+    
+    import subprocess
+    import shutil
+    
+    health_issues = []
+    
+    # 1. Check FFmpeg
+    print("   Checking FFmpeg...", end=" ")
+    if shutil.which("ffmpeg"):
+        try:
+            result = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True, timeout=10)
+            version = result.stdout.split('\n')[0] if result.stdout else "unknown"
+            print(f"✓ ({version[:40]})")
+        except Exception as e:
+            print(f"✗")
+            health_issues.append(f"FFmpeg found but not working: {e}")
+    else:
+        print("✗")
+        health_issues.append("FFmpeg not found. Install with: winget install ffmpeg (Windows) or brew install ffmpeg (Mac)")
+    
+    # 2. Check FFprobe
+    print("   Checking FFprobe...", end=" ")
+    if shutil.which("ffprobe"):
+        print("✓")
+    else:
+        print("✗")
+        health_issues.append("FFprobe not found. It should come with FFmpeg.")
+    
+    # 3. Check Gemini API Key
+    print("   Checking Gemini API key...", end=" ")
+    gemini_key = os.getenv("GOOGLE_API_KEY")
+    if gemini_key and len(gemini_key) > 20:
+        print(f"✓ ({gemini_key[:8]}...)")
+    else:
+        print("✗")
+        health_issues.append("GOOGLE_API_KEY not set or invalid. Add to .env file.")
+    
+    # 4. Check GCP Project ID
+    print("   Checking GCP Project ID...", end=" ")
+    if PROJECT_ID and PROJECT_ID != "your-project-id":
+        print(f"✓ ({PROJECT_ID})")
+    else:
+        print("⚠️ (using default)")
+    
+    # 5. Check disk space
+    print("   Checking disk space...", end=" ")
+    try:
+        import shutil
+        total, used, free = shutil.disk_usage("/")
+        free_gb = free / (1024 ** 3)
+        if free_gb > 5:
+            print(f"✓ ({free_gb:.1f} GB free)")
+        elif free_gb > 1:
+            print(f"⚠️ ({free_gb:.1f} GB free - low)")
+        else:
+            print(f"✗ ({free_gb:.1f} GB free)")
+            health_issues.append(f"Low disk space: {free_gb:.1f} GB. Need at least 5GB for video processing.")
+    except Exception as e:
+        print(f"⚠️ (couldn't check: {e})")
+    
+    # Report health check results
+    if health_issues:
+        print("\n" + "=" * 60)
+        print("⚠️  HEALTH CHECK WARNINGS:")
+        for issue in health_issues:
+            print(f"   • {issue}")
+        print("=" * 60)
+        # Don't crash, just warn - some issues are non-fatal
+    else:
+        print("   ✅ All dependency checks passed!")
+    
+    # =========================================================================
+    # INITIALIZE COMPONENTS
+    # =========================================================================
     
     # Create directories
     for dir_path in [UPLOAD_DIR, OUTPUT_DIR, DATA_DIR]:
@@ -278,33 +373,41 @@ async def process_from_json(
 
 async def process_json_pipeline(job_id: str, json_data: dict):
     """Background processing for JSON input"""
-    from backend.core.downloader import download_video
+    from backend.core.downloader import download_video, download_all_videos_async
+    import asyncio
     
     try:
         # Create download directory
         download_dir = UPLOAD_DIR / "json" / job_id
         download_dir.mkdir(parents= True, exist_ok=True)
         
-        # Download B-Roll videos
-        jobs[job_id]["message"] = "Downloading B-Roll videos..."
+        # Download B-Roll videos IN PARALLEL (First Principles: I/O bound = async wins!)
+        # Old: Sequential → N videos × 10s = 60s
+        # New: Parallel → N videos in ~10s (slowest download time)
+        jobs[job_id]["message"] = "Downloading B-Roll videos in parallel..."
         jobs[job_id]["progress"] = 5
         
         b_rolls = json_data.get("b_rolls", [])
-        broll_files = []
         
+        # Build list of (url, output_path) tuples for parallel download
+        download_tasks = []
         for i, broll in enumerate(b_rolls):
             url = broll.get("url")
             if not url:
                 continue
-                
             broll_id = broll.get("id", f"broll_{i}")
             output_path = download_dir / f"{broll_id}.mp4"
-            
-            if download_video(url, output_path):
-                broll_files.append(output_path)
-            
-            progress = 5 + int((i + 1) / len(b_rolls) * 15)
-            jobs[job_id]["progress"] = progress
+            download_tasks.append((url, output_path))
+        
+        # Execute all downloads in parallel!
+        results = await download_all_videos_async(download_tasks)
+        
+        # Collect successful downloads
+        broll_files = [
+            path for (url, path), success in zip(download_tasks, results) if success
+        ]
+        
+        jobs[job_id]["progress"] = 20
         
         if not broll_files:
             jobs[job_id]["status"] = "error"
@@ -405,15 +508,17 @@ async def process_json_pipeline(job_id: str, json_data: dict):
             jobs[job_id]["status"] = "processing"
             jobs[job_id]["progress"] = 50
             
-            # Extract audio
+            # Extract audio (wrapped in thread - subprocess is I/O bound)
+            # First Principles: subprocess.run() blocks the event loop
+            # asyncio.to_thread() runs it in a thread pool, freeing the event loop
             jobs[job_id]["message"] = "Extracting audio..."
             audio_path = aroll_path.with_suffix(".wav")
-            audio_sensor.extract_audio(aroll_path, audio_path)
+            await asyncio.to_thread(audio_sensor.extract_audio, aroll_path, audio_path)
             jobs[job_id]["progress"] = 55
             
-            # Transcribe
+            # Transcribe (wrapped in thread - network I/O to Vertex AI)
             jobs[job_id]["message"] = "Transcribing with Vertex AI Speech-to-Text..."
-            aligned = audio_sensor.transcribe_and_align(audio_path)
+            aligned = await asyncio.to_thread(audio_sensor.transcribe_and_align, audio_path)
             jobs[job_id]["progress"] = 70
             
             # AUTONOMOUS LLM EDITOR: One call does EVERYTHING
@@ -427,13 +532,16 @@ async def process_json_pipeline(job_id: str, json_data: dict):
                 # Fallback to segment text
                 full_transcript = " ".join([s["text"] for s in aligned.get("segments", [])])
             
-            # Use Autonomous Editor (ONE API CALL!)
-            from backend.core.autonomous_editor import AutonomousEditor
-            editor = AutonomousEditor()
-            timeline = editor.create_timeline(
-                transcript=full_transcript,
-                word_timestamps=word_timestamps,
-                available_clips=all_metadata  # B-Roll options
+            # Use Autonomous Editor via dependency injection
+            # VLM call wrapped in thread - network I/O to Gemini API
+            from backend.core import get_container
+            container = get_container()
+            editor = container.get_editor()
+            timeline = await asyncio.to_thread(
+                editor.create_timeline,
+                full_transcript,
+                word_timestamps,
+                all_metadata  # B-Roll options
             )
             
             jobs[job_id]["progress"] = 85
@@ -447,10 +555,12 @@ async def process_json_pipeline(job_id: str, json_data: dict):
             }
             jobs[job_id]["progress"] = 85
             
-            # Assemble video
+            # Assemble video (wrapped in thread - FFmpeg subprocess is I/O bound)
             jobs[job_id]["message"] = "Assembling final video..."
             output_path = OUTPUT_DIR / f"{job_id}_final.mp4"
-            VideoActuator.assemble_timeline(aroll_path, timeline, output_path)
+            await asyncio.to_thread(
+                VideoActuator.assemble_timeline, aroll_path, timeline, output_path
+            )
             
             jobs[job_id]["status"] = "complete"
             jobs[job_id]["progress"] = 100

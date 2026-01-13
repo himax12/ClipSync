@@ -54,16 +54,25 @@ st.markdown("""
 st.markdown('<div class="main-header">🎬 Semantic Video Matching Engine</div>', unsafe_allow_html=True)
 st.markdown('<div class="subtitle">AI-Powered A-Roll/B-Roll Matching with Vertex AI + WhisperX + FAISS</div>', unsafe_allow_html=True)
 
-# Check API health
-try:
-    response = requests.get(f"{API_BASE.replace('/api', '')}/", timeout=2)
-    if response.ok:
-        st.success("✅ Backend API is online")
-    else:
-        st.error("❌ Backend API returned error")
-except:
-    st.error("❌ Cannot connect to backend API. Please start the FastAPI server.")
-    st.code("uv run uvicorn backend.main:app --reload", language="bash")
+# Check API health (backend can take 10+ seconds to initialize)
+api_online = False
+with st.spinner("🔄 Connecting to backend API..."):
+    try:
+        response = requests.get(f"{API_BASE.replace('/api', '')}/", timeout=15)
+        if response.ok:
+            st.success("✅ Backend API is online")
+            api_online = True
+        else:
+            st.error(f"❌ Backend API returned error: {response.status_code}")
+    except requests.exceptions.ConnectionError:
+        st.error("❌ Cannot connect to backend API. Please start the FastAPI server.")
+        st.code("uv run uvicorn backend.main:app --host 127.0.0.1 --port 8000 --reload", language="bash")
+    except requests.exceptions.Timeout:
+        st.warning("⏳ Backend API is starting up... Please refresh the page in a few seconds.")
+    except Exception as e:
+        st.error(f"❌ Backend API error: {e}")
+
+if not api_online:
     st.stop()
 
 # Get index stats

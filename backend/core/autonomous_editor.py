@@ -12,9 +12,12 @@ Key principles:
 import os
 import json
 import base64
+import time
 import requests
 from typing import List, Dict, Optional
 from pathlib import Path
+
+from .config import get_config
 
 
 class AutonomousEditor:
@@ -25,15 +28,20 @@ class AutonomousEditor:
     Output: List of cuts with timestamps and clip numbers
     
     ONE API call, NO text matching, works with ANY language.
+    All settings configurable via environment variables.
     """
     
     def __init__(self, api_key: Optional[str] = None):
-        self.api_key = api_key or os.getenv("GOOGLE_API_KEY")
+        # Use centralized config - no more hardcoded values!
+        self.config = get_config()
+        
+        self.api_key = api_key or self.config.google_api_key
         if not self.api_key:
             raise ValueError("GOOGLE_API_KEY required")
         
-        self.endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
-        print("✓ VLM Editor initialized")
+        # Use config for endpoint (allows switching models via env var)
+        self.endpoint = self.config.gemini_api_url
+        print(f"✓ VLM Editor initialized (model: {self.config.gemini_model})")
     
     def create_timeline(
         self,
@@ -114,6 +122,8 @@ I have {len(clips)} B-Roll clips to choose from. Here they are:
         
         # Add B-Roll images (1 frame each is sufficient)
         clips_with_images = 0
+        failed_clips = []
+        
         for i, clip in enumerate(clips):
             clip_name = clip.get('name', f'clip_{i+1}')
             frames = clip.get("frames", [])
@@ -134,10 +144,27 @@ I have {len(clips)} B-Roll clips to choose from. Here they are:
                             }
                         })
                         clips_with_images += 1
-                    except:
-                        pass
+                    except Exception as e:
+                        # Log the specific error instead of silently ignoring
+                        print(f"   ⚠️ Failed to load frame for {clip_name}: {e}")
+                        failed_clips.append(clip_name)
+                else:
+                    print(f"   ⚠️ Frame file missing for {clip_name}: {frame_path}")
+                    failed_clips.append(clip_name)
+            else:
+                print(f"   ⚠️ No frames extracted for {clip_name}")
+                failed_clips.append(clip_name)
         
-        print(f"   🖼️ {clips_with_images}/{len(clips)} clips with images")
+        # CRITICAL: Warn if too many clips have no images
+        # VLM would be making blind decisions without visual context!
+        if len(clips) > 0:
+            image_coverage = clips_with_images / len(clips)
+            print(f"   🖼️ {clips_with_images}/{len(clips)} clips with images ({image_coverage*100:.0f}% coverage)")
+            
+            if image_coverage < 0.5:
+                print(f"   ⚠️ WARNING: Less than 50% of clips have images!")
+                print(f"   ⚠️ Failed clips: {', '.join(failed_clips)}")
+                print(f"   ⚠️ VLM will make blind decisions for these clips")
         
         # Decision prompt - ask for TIMESTAMPS, MUST USE ALL CLIPS
         parts.append({
@@ -170,24 +197,67 @@ Return ONLY the JSON, nothing else."""
         return parts
     
     def _call_vlm(self, parts: List[Dict]) -> str:
-        """Call Gemini VLM API."""
+        """
+        Call Gemini VLM API with retry logic.
+        
+        First Principles:
+        - VLM APIs have transient failures (rate limits, 503s, timeouts)
+        - Exponential backoff prevents thundering herd
+        - All settings configurable via environment variables
+        """
         headers = {"Content-Type": "application/json"}
         url = f"{self.endpoint}?key={self.api_key}"
         
+        # Use config for VLM settings (no more hardcoded values!)
         payload = {
             "contents": [{"parts": parts}],
             "generationConfig": {
-                "temperature": 0.3,
-                "maxOutputTokens": 1000
+                "temperature": self.config.vlm_temperature,
+                "maxOutputTokens": self.config.vlm_max_tokens
             }
         }
         
-        response = requests.post(url, headers=headers, json=payload, timeout=90)
+        # Retry with exponential backoff (settings from config)
+        max_retries = self.config.vlm_max_retries
+        base_delay = self.config.vlm_retry_base_delay
+        timeout = self.config.vlm_timeout_seconds
         
-        if response.status_code != 200:
-            raise RuntimeError(f"API error {response.status_code}: {response.text[:200]}")
+        for attempt in range(max_retries):
+            try:
+                response = requests.post(url, headers=headers, json=payload, timeout=timeout)
+                
+                # Success!
+                if response.status_code == 200:
+                    return response.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+                
+                # Retryable errors (rate limit, server error)
+                if response.status_code in [429, 500, 502, 503, 504]:
+                    if attempt < max_retries - 1:
+                        delay = base_delay * (2 ** attempt)  # 1s, 2s, 4s
+                        print(f"   ⚠️ VLM API error {response.status_code}, retrying in {delay}s...")
+                        time.sleep(delay)
+                        continue
+                
+                # Non-retryable error
+                raise RuntimeError(f"API error {response.status_code}: {response.text[:200]}")
+                
+            except requests.exceptions.Timeout:
+                if attempt < max_retries - 1:
+                    delay = base_delay * (2 ** attempt)
+                    print(f"   ⚠️ VLM API timeout, retrying in {delay}s...")
+                    time.sleep(delay)
+                    continue
+                raise RuntimeError("VLM API timeout after 3 retries")
+                
+            except requests.exceptions.ConnectionError as e:
+                if attempt < max_retries - 1:
+                    delay = base_delay * (2 ** attempt)
+                    print(f"   ⚠️ VLM connection error, retrying in {delay}s...")
+                    time.sleep(delay)
+                    continue
+                raise RuntimeError(f"VLM connection failed: {e}")
         
-        return response.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+        raise RuntimeError("VLM API failed after max retries")
     
     def _parse_response(
         self,
