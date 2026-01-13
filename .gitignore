@@ -1,0 +1,48 @@
+# Ignore Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# UV
+.uv/
+
+# Data directories
+uploads/
+outputs/
+data/
+*.wav
+*.mp4
+*.mov
+*.avi
+*.jpg
+*.jpeg
+*.png
+frames/
+
+# Environment
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Models (large files)
+*.pth
+*.pt
+*.bin
+*.index
+*.meta
+models/
