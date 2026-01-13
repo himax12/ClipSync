@@ -8,7 +8,13 @@
 
 ---
 
-## 🎯 What It Does
+## � Demo
+
+https://github.com/user-attachments/assets/demo.mp4
+
+---
+
+## �🎯 What It Does
 
 Upload an A-Roll video (person talking) and B-Roll clips (supporting footage), and the AI automatically:
 
