@@ -7,11 +7,16 @@ __pycache__/
 
 # Virtual environments
 venv/
-env/
+.env
 .venv/
 
 # UV
 .uv/
+
+# Frontend build and dependencies
+frontend-next/node_modules/
+frontend-next/.next/
+frontend-next/out/
 
 # Data directories
 uploads/
@@ -38,6 +43,7 @@ frames/
 # OS
 .DS_Store
 Thumbs.db
+nul
 
 # Models (large files)
 *.pth

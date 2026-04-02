@@ -8,9 +8,9 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements and install Python dependencies
-COPY pyproject.toml uv.lock ./
-RUN pip install --no-cache-dir -r <(grep -v 'faiss-cpu' pyproject.toml)
-RUN pip install --no-cache-dir faiss-cpu
+# First install without faiss-cpu, then install faiss-cpu separately
+RUN pip install --no-cache-dir pyproject.toml && \
+    pip install --no-cache-dir faiss-cpu
 
 # Copy application code
 COPY . .
