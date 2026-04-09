@@ -10,6 +10,8 @@ from typing import Dict, List
 import subprocess
 import os
 
+from .energy_analyzer import enrich_segments_with_energy
+
 
 class AudioSensor:
     def __init__(self, project_id: str, location: str = "us-central1"):
@@ -266,6 +268,9 @@ RULES:
                         "llm_reason": seg_data.get("reason", "")
                     })
             
+            if final_segments:
+                final_segments = enrich_segments_with_energy(final_segments, word_segments)
+            
             print(f"✓ LLM created {len(final_segments)} semantic segments")
             for i, seg in enumerate(final_segments):
                 print(f"   Segment {i+1}: {seg['text'][:40]}... ({seg['duration']:.1f}s)")
@@ -323,6 +328,9 @@ RULES:
                 "end": current["end"],
                 "duration": current["end"] - current["start"]
             })
+        
+        if segments:
+            segments = enrich_segments_with_energy(segments, word_segments)
         
         return segments
     
