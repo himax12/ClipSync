@@ -10,6 +10,90 @@ from typing import Dict, List
 import subprocess
 import os
 
+DEFAULT_FILLERS = {"um", "uh", "er", "ah", "like", "you know", "well"}
+
+
+def detect_pauses(word_segments: List[Dict], pause_threshold: float = 2.0) -> List[Dict]:
+    """Identify natural cut points where speaker pauses > threshold seconds."""
+    if len(word_segments) < 2:
+        return []
+    
+    pauses = []
+    for i, word in enumerate(word_segments[:-1]):
+        gap = word_segments[i + 1]["start"] - word["end"]
+        if gap > pause_threshold:
+            pauses.append({
+                "index": i,
+                "start": word["end"],
+                "end": word_segments[i + 1]["start"],
+                "duration": gap
+            })
+    return pauses
+
+
+def count_pauses_in_range(word_segments: List[Dict], pauses: List[Dict], start: float, end: float) -> int:
+    """Count pauses within a time range."""
+    return sum(1 for p in pauses if start <= p["start"] <= end)
+
+
+def filter_low_confidence(
+    word_segments: List[Dict],
+    min_confidence: float = 0.7,
+    fillers: set = None
+) -> List[Dict]:
+    """Filter words with confidence < min_confidence and filler words."""
+    fillers = fillers or DEFAULT_FILLERS
+    return [
+        w for w in word_segments
+        if w.get("confidence", 1.0) >= min_confidence
+        and w["word"].lower().strip() not in fillers
+    ]
+
+
+def calculate_avg_confidence(word_segments: List[Dict]) -> float:
+    """Calculate average confidence of word segments."""
+    if not word_segments:
+        return 1.0
+    return sum(w.get("confidence", 1.0) for w in word_segments) / len(word_segments)
+
+
+def estimate_energy_level(word_segments: List[Dict]) -> str:
+    """Estimate speech energy level based on pace (words per second)."""
+    if len(word_segments) < 2:
+        return "medium"
+    
+    total_duration = word_segments[-1]["end"] - word_segments[0]["start"]
+    if total_duration <= 0:
+        return "medium"
+    
+    words_per_second = len(word_segments) / total_duration
+    
+    if words_per_second < 1.5:
+        return "low"
+    elif words_per_second > 3.0:
+        return "high"
+    return "medium"
+
+
+def extract_topics_from_segments(segments: List[Dict]) -> List[str]:
+    """Extract top topics from segment texts (simple keyword approach)."""
+    topic_keywords = {
+        "technical": {"code", "programming", "software", "api", "function", "system"},
+        "personal": {"i", "me", "my", "we", "our", "family", "home"},
+        "business": {"company", "revenue", "customer", "market", "sales", "product"},
+        "creative": {"design", "art", "creative", "music", "video", "story"},
+        "process": {"step", "process", "method", "approach", "workflow", "pipeline"},
+    }
+    
+    all_text = " ".join(seg.get("text", "").lower() for seg in segments)
+    detected = []
+    
+    for topic, keywords in topic_keywords.items():
+        if any(kw in all_text for kw in keywords):
+            detected.append(topic)
+    
+    return detected[:5]
+
 
 class AudioSensor:
     def __init__(self, project_id: str, location: str = "us-central1"):
@@ -140,73 +224,76 @@ class AudioSensor:
             max_duration: Maximum segment length (hard constraint for API limits)
         
         Returns:
-            List of segments with text, start, end, and duration
+            List of segments with text, start, end, duration, and metadata
         """
-        import os
         import json
+        import re
         import requests
         
-        # Get full transcript
         word_segments = aligned_result.get("word_segments", [])
         raw_segments = aligned_result.get("segments", [])
         
-        # Build full transcript with timestamps
         full_text = " ".join([w["word"] for w in word_segments]) if word_segments else " ".join([s["text"] for s in raw_segments])
         
         if not full_text.strip():
             return []
         
-        # Get video duration
-        if word_segments:
-            video_duration = word_segments[-1]["end"]
-        elif raw_segments:
-            video_duration = raw_segments[-1]["end"]
-        else:
-            video_duration = 30.0  # Default
+        video_duration = (
+            word_segments[-1]["end"] if word_segments
+            else raw_segments[-1]["end"] if raw_segments
+            else 30.0
+        )
         
-        # Ask LLM to identify segment boundaries
+        pauses = detect_pauses(word_segments)
+        pause_info = f"\nSIGNIFICANT PAUSES: {len(pauses)} pauses > 2s detected at times: {[round(p['start'], 1) for p in pauses]}" if pauses else ""
+        
         api_key = os.getenv("GOOGLE_API_KEY")
         if not api_key:
             print("⚠️ No GOOGLE_API_KEY, using fallback segmentation")
             return self._fallback_segmentation(aligned_result, min_duration, max_duration)
         
-        prompt = f"""You are a video editor identifying B-Roll insertion points.
+        prompt = f"""You are an expert video editor analyzing speech content.
 
 TRANSCRIPT: "{full_text}"
-VIDEO DURATION: {video_duration:.1f} seconds
+VIDEO DURATION: {video_duration:.1f} seconds{pause_info}
 
-TASK: Identify 2-6 natural "cut points" where B-Roll would enhance the narrative.
+TASK: Identify 2-6 natural segments where B-Roll would enhance the narrative.
 
-Think about:
-1. Topic changes ("First... then... finally...")
-2. Key visual moments (describing actions, places, objects)
-3. Emotional shifts
-4. Pauses or transitions
+CHAIN-OF-THOUGHT ANALYSIS:
+1. NARRATIVE STRUCTURE: Identify the overall story arc (setup, development, conclusion)
+2. TOPIC CHANGES: Note distinct subject matter shifts (technical topic vs personal story)
+3. VISUAL MOMENTS: Look for descriptions of actions, places, objects, people
+4. ENERGY LEVELS: Identify transitions between fast-paced explanation and slow reflection
+5. PAUSE AWARENESS: Use natural pauses as potential segment boundaries
 
 OUTPUT FORMAT (JSON only):
 {{
   "segments": [
-    {{"text": "first part of transcript...", "reason": "why B-Roll here"}},
-    {{"text": "second part...", "reason": "why B-Roll here"}}
+    {{
+      "text": "exact words from transcript...",
+      "reason": "narrative purpose (1 sentence)",
+      "topic": "main topic category",
+      "energy": "high/medium/low"
+    }}
   ]
 }}
 
 RULES:
-- Each segment should be roughly 3-15 seconds of speech
-- Use EXACT words from the transcript
-- Cover the ENTIRE transcript (no gaps)
-- 2-6 segments total"""
+- Use EXACT words from transcript (preserve punctuation)
+- Cover ENTIRE transcript (no gaps)
+- 2-6 segments, each 3-15 seconds of speech
+- Include transition words naturally"""
 
         try:
-            endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+            endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-pro-preview:generateContent"
             headers = {"Content-Type": "application/json"}
             
             payload = {
                 "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"temperature": 0.3, "maxOutputTokens": 500}
+                "generationConfig": {"temperature": 0.3, "maxOutputTokens": 800}
             }
             
-            response = requests.post(f"{endpoint}?key={api_key}", headers=headers, json=payload, timeout=30)
+            response = requests.post(f"{endpoint}?key={api_key}", headers=headers, json=payload, timeout=60)
             
             if response.status_code != 200:
                 print(f"⚠️ LLM segmentation failed: {response.status_code}")
@@ -214,20 +301,14 @@ RULES:
             
             result_text = response.json()["candidates"][0]["content"]["parts"][0]["text"]
             
-            # Parse JSON from response
-            import re
             json_match = re.search(r'\{[^{}]*"segments"[^{}]*\[.*?\]\s*\}', result_text, re.DOTALL)
-            if json_match:
-                result = json.loads(json_match.group())
-            else:
-                result = json.loads(result_text)
+            result = json.loads(json_match.group()) if json_match else json.loads(result_text)
             
             llm_segments = result.get("segments", [])
             
             if not llm_segments:
                 return self._fallback_segmentation(aligned_result, min_duration, max_duration)
             
-            # Map LLM segments to timestamps
             final_segments = []
             word_index = 0
             
@@ -236,10 +317,7 @@ RULES:
                 if not seg_text:
                     continue
                 
-                # Find matching words
-                seg_words = seg_text.lower().split()[:5]  # Match first 5 words
-                
-                # Find start position
+                seg_words = seg_text.lower().split()[:5]
                 start_time = None
                 end_time = None
                 matched_text = ""
@@ -252,25 +330,36 @@ RULES:
                         matched_text += " " + w["word"]
                         end_time = w["end"]
                         
-                        # Check if we've matched enough
                         if len(matched_text.split()) >= len(seg_text.split()) * 0.8:
                             word_index = i + 1
                             break
                 
                 if start_time is not None and end_time is not None:
+                    seg_word_range = [w for w in word_segments if start_time <= w["start"] <= end_time]
+                    pause_count = count_pauses_in_range(word_segments, pauses, start_time, end_time)
+                    avg_conf = calculate_avg_confidence(seg_word_range)
+                    topics = extract_topics_from_segments([{"text": seg_data.get("topic", ""), **seg_data}])
+                    
                     final_segments.append({
                         "text": matched_text.strip(),
                         "start": start_time,
                         "end": end_time,
                         "duration": end_time - start_time,
-                        "llm_reason": seg_data.get("reason", "")
+                        "llm_reason": seg_data.get("reason", ""),
+                        "pause_count": pause_count,
+                        "avg_confidence": round(avg_conf, 2),
+                        "topics": topics or [seg_data.get("topic", "general")],
+                        "energy_level": seg_data.get("energy", estimate_energy_level(seg_word_range))
                     })
             
-            print(f"✓ LLM created {len(final_segments)} semantic segments")
-            for i, seg in enumerate(final_segments):
-                print(f"   Segment {i+1}: {seg['text'][:40]}... ({seg['duration']:.1f}s)")
+            if not final_segments:
+                return self._fallback_segmentation(aligned_result, min_duration, max_duration)
             
-            return final_segments if final_segments else self._fallback_segmentation(aligned_result, min_duration, max_duration)
+            print(f"✓ LLM created {len(final_segments)} semantic segments with metadata")
+            for i, seg in enumerate(final_segments):
+                print(f"   Segment {i+1}: {seg['text'][:40]}... ({seg['duration']:.1f}s, {seg['energy_level']})")
+            
+            return final_segments
             
         except Exception as e:
             print(f"⚠️ LLM segmentation error: {e}")
@@ -282,10 +371,11 @@ RULES:
         min_duration: float = 3.0,
         max_duration: float = 10.0
     ) -> List[Dict]:
-        """Simple time-based fallback if LLM fails"""
+        """Simple time-based fallback if LLM fails."""
         segments = []
         current = {"text": "", "start": None, "end": None}
         word_segments = aligned_result.get("word_segments", [])
+        pauses = detect_pauses(word_segments)
         
         if not word_segments:
             for seg in aligned_result.get("segments", []):
@@ -293,7 +383,11 @@ RULES:
                     "text": seg["text"].strip(),
                     "start": seg["start"],
                     "end": seg["end"],
-                    "duration": seg["end"] - seg["start"]
+                    "duration": seg["end"] - seg["start"],
+                    "pause_count": 0,
+                    "avg_confidence": 1.0,
+                    "topics": ["general"],
+                    "energy_level": "medium"
                 })
             return segments
         
@@ -308,20 +402,36 @@ RULES:
             is_sentence_end = word["word"].rstrip().endswith((".", "!", "?"))
             
             if (is_sentence_end and duration >= min_duration) or duration >= max_duration:
+                seg_start = current["start"]
+                seg_end = current["end"]
+                seg_words = [w for w in word_segments if seg_start <= w["start"] <= seg_end]
+                
                 segments.append({
                     "text": current["text"].strip(),
-                    "start": current["start"],
-                    "end": current["end"],
-                    "duration": duration
+                    "start": seg_start,
+                    "end": seg_end,
+                    "duration": duration,
+                    "pause_count": count_pauses_in_range(word_segments, pauses, seg_start, seg_end),
+                    "avg_confidence": calculate_avg_confidence(seg_words),
+                    "topics": extract_topics_from_segments([current]),
+                    "energy_level": estimate_energy_level(seg_words)
                 })
                 current = {"text": "", "start": None, "end": None}
         
         if current["text"].strip():
+            seg_start = current["start"]
+            seg_end = current["end"]
+            seg_words = [w for w in word_segments if seg_start <= w["start"] <= seg_end]
+            
             segments.append({
                 "text": current["text"].strip(),
-                "start": current["start"],
-                "end": current["end"],
-                "duration": current["end"] - current["start"]
+                "start": seg_start,
+                "end": seg_end,
+                "duration": seg_end - seg_start,
+                "pause_count": count_pauses_in_range(word_segments, pauses, seg_start, seg_end),
+                "avg_confidence": calculate_avg_confidence(seg_words),
+                "topics": extract_topics_from_segments([current]),
+                "energy_level": estimate_energy_level(seg_words)
             })
         
         return segments
