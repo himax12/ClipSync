@@ -6,13 +6,18 @@ Extracts word-level transcription using Google Cloud Speech-to-Text V2
 from google.cloud import speech_v2
 from google.cloud.speech_v2 import types
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 import subprocess
 import os
 
 
 class AudioSensor:
-    def __init__(self, project_id: str, location: str = "us-central1"):
+    def __init__(
+        self,
+        project_id: str,
+        location: str = "us-central1",
+        topic_identifier: Optional[object] = None
+    ):
         """
         Initialize Audio Sensor with Vertex AI Speech-to-Text
         
@@ -26,10 +31,12 @@ class AudioSensor:
         Args:
             project_id: GCP project ID
             location: GCP region (default: us-central1)
+            topic_identifier: Optional TopicIdentifier for segment tagging
         """
         self.project_id = project_id
         self.location = location
         self.client = speech_v2.SpeechClient()
+        self.topic_identifier = topic_identifier
         
         print(f"✓ Vertex AI Speech-to-Text initialized (project: {project_id})")
     
@@ -140,31 +147,27 @@ class AudioSensor:
             max_duration: Maximum segment length (hard constraint for API limits)
         
         Returns:
-            List of segments with text, start, end, and duration
+            List of segments with text, start, end, duration, and topics
         """
         import os
         import json
         import requests
         
-        # Get full transcript
         word_segments = aligned_result.get("word_segments", [])
         raw_segments = aligned_result.get("segments", [])
         
-        # Build full transcript with timestamps
         full_text = " ".join([w["word"] for w in word_segments]) if word_segments else " ".join([s["text"] for s in raw_segments])
         
         if not full_text.strip():
             return []
         
-        # Get video duration
         if word_segments:
             video_duration = word_segments[-1]["end"]
         elif raw_segments:
             video_duration = raw_segments[-1]["end"]
         else:
-            video_duration = 30.0  # Default
+            video_duration = 30.0
         
-        # Ask LLM to identify segment boundaries
         api_key = os.getenv("GOOGLE_API_KEY")
         if not api_key:
             print("⚠️ No GOOGLE_API_KEY, using fallback segmentation")
@@ -214,7 +217,6 @@ RULES:
             
             result_text = response.json()["candidates"][0]["content"]["parts"][0]["text"]
             
-            # Parse JSON from response
             import re
             json_match = re.search(r'\{[^{}]*"segments"[^{}]*\[.*?\]\s*\}', result_text, re.DOTALL)
             if json_match:
@@ -227,7 +229,6 @@ RULES:
             if not llm_segments:
                 return self._fallback_segmentation(aligned_result, min_duration, max_duration)
             
-            # Map LLM segments to timestamps
             final_segments = []
             word_index = 0
             
@@ -236,10 +237,8 @@ RULES:
                 if not seg_text:
                     continue
                 
-                # Find matching words
-                seg_words = seg_text.lower().split()[:5]  # Match first 5 words
+                seg_words = seg_text.lower().split()[:5]
                 
-                # Find start position
                 start_time = None
                 end_time = None
                 matched_text = ""
@@ -252,7 +251,6 @@ RULES:
                         matched_text += " " + w["word"]
                         end_time = w["end"]
                         
-                        # Check if we've matched enough
                         if len(matched_text.split()) >= len(seg_text.split()) * 0.8:
                             word_index = i + 1
                             break
@@ -263,8 +261,12 @@ RULES:
                         "start": start_time,
                         "end": end_time,
                         "duration": end_time - start_time,
-                        "llm_reason": seg_data.get("reason", "")
+                        "llm_reason": seg_data.get("reason", ""),
+                        "confidence": 0.95,
+                        "pause_count": 0
                     })
+            
+            final_segments = self._add_topics_to_segments(final_segments, full_text)
             
             print(f"✓ LLM created {len(final_segments)} semantic segments")
             for i, seg in enumerate(final_segments):
@@ -275,6 +277,19 @@ RULES:
         except Exception as e:
             print(f"⚠️ LLM segmentation error: {e}")
             return self._fallback_segmentation(aligned_result, min_duration, max_duration)
+    
+    def _add_topics_to_segments(
+        self,
+        segments: List[Dict],
+        full_transcript: str
+    ) -> List[Dict]:
+        """Add topics to segments using topic_identifier if available"""
+        if not self.topic_identifier or not segments:
+            for seg in segments:
+                seg["topics"] = []
+            return segments
+        
+        return self.topic_identifier.tag_segments(segments, full_transcript)
     
     def _fallback_segmentation(
         self,
@@ -293,7 +308,10 @@ RULES:
                     "text": seg["text"].strip(),
                     "start": seg["start"],
                     "end": seg["end"],
-                    "duration": seg["end"] - seg["start"]
+                    "duration": seg["end"] - seg["start"],
+                    "topics": [],
+                    "confidence": 0.8,
+                    "pause_count": 0
                 })
             return segments
         
@@ -312,7 +330,10 @@ RULES:
                     "text": current["text"].strip(),
                     "start": current["start"],
                     "end": current["end"],
-                    "duration": duration
+                    "duration": duration,
+                    "topics": [],
+                    "confidence": 0.8,
+                    "pause_count": 0
                 })
                 current = {"text": "", "start": None, "end": None}
         
@@ -321,10 +342,14 @@ RULES:
                 "text": current["text"].strip(),
                 "start": current["start"],
                 "end": current["end"],
-                "duration": current["end"] - current["start"]
+                "duration": current["end"] - current["start"],
+                "topics": [],
+                "confidence": 0.8,
+                "pause_count": 0
             })
         
-        return segments
+        full_text = " ".join([w["word"] for w in word_segments])
+        return self._add_topics_to_segments(segments, full_text)
     
     def cleanup(self):
         """Cleanup (no GPU memory to free with Vertex AI!)"""
